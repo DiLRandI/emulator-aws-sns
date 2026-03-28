@@ -47,7 +47,7 @@ func ValidateTopicName(name string, fifo bool) error {
 	return nil
 }
 
-func ValidateFIFOIdentifier(v string, field string) error {
+func ValidateFIFOIdentifier(v, field string) error {
 	if v == "" {
 		return fmt.Errorf("%s is required", field)
 	}

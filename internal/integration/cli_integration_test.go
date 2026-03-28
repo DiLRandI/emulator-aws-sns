@@ -184,6 +184,32 @@ func TestCLISuiteSQSAndFIFO(t *testing.T) {
 	awsText(t, h, "sns", "delete-topic", "--topic-arn", fifoTopicArn)
 }
 
+func TestCLISuiteSQLitePersistenceAcrossRestart(t *testing.T) {
+	if _, err := exec.LookPath("aws"); err != nil {
+		t.Skip("aws cli not installed")
+	}
+	h := testsupport.NewSQLiteHarness(t)
+	queueARN := h.SQS.AddQueue("cli-persist.fifo", true)
+
+	topicArn := awsText(t, h, "sns", "create-topic", "--name", "cli-persist.fifo", "--attributes", "FifoTopic=true,ContentBasedDeduplication=false", "--query", "TopicArn", "--output", "text")
+	subArn := awsText(t, h, "sns", "subscribe", "--topic-arn", topicArn, "--protocol", "sqs", "--notification-endpoint", queueARN, "--return-subscription-arn", "--query", "SubscriptionArn", "--output", "text")
+	awsText(t, h, "sns", "set-subscription-attributes", "--subscription-arn", subArn, "--attribute-name", "RawMessageDelivery", "--attribute-value", "true")
+	awsText(t, h, "sns", "publish", "--topic-arn", topicArn, "--message", "cli-persist", "--message-group-id", "group-a", "--message-deduplication-id", "dedup-a")
+
+	h.Restart()
+	if len(h.SQS.Messages(queueARN)) != 1 {
+		t.Fatalf("expected one SQS message before restart verification, got %d", len(h.SQS.Messages(queueARN)))
+	}
+	attrs := awsJSON(t, h, "sns", "get-topic-attributes", "--topic-arn", topicArn)
+	if attrs["Attributes"].(map[string]any)["FifoTopic"] != "true" {
+		t.Fatalf("expected persisted topic attributes after restart, got %#v", attrs)
+	}
+	awsText(t, h, "sns", "publish", "--topic-arn", topicArn, "--message", "cli-persist", "--message-group-id", "group-a", "--message-deduplication-id", "dedup-a")
+	if len(h.SQS.Messages(queueARN)) != 1 {
+		t.Fatalf("expected CLI dedup state to survive restart, got %d messages", len(h.SQS.Messages(queueARN)))
+	}
+}
+
 func awsText(t *testing.T, h *testsupport.Harness, args ...string) string {
 	t.Helper()
 	out, _ := runAWS(t, h, args...)

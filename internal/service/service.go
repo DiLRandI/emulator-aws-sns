@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -17,15 +18,16 @@ import (
 	httpproto "emulator-aws-sns/internal/protocol/http"
 	sqsproto "emulator-aws-sns/internal/protocol/sqs"
 	"emulator-aws-sns/internal/signing"
-	"emulator-aws-sns/internal/store/memory"
+	storepkg "emulator-aws-sns/internal/store"
 	"emulator-aws-sns/internal/util"
 )
 
 type Config struct {
-	Region    string
-	AccountID string
-	BaseURL   string
-	PageSize  int
+	Region               string
+	AccountID            string
+	BaseURL              string
+	PageSize             int
+	DeliveryPollInterval time.Duration
 }
 
 type ProtocolAdapter interface {
@@ -36,14 +38,16 @@ type ProtocolAdapter interface {
 
 type Service struct {
 	cfg       Config
-	store     *memory.Store
+	store     storepkg.Store
 	clock     util.Clock
 	signer    *signing.Provider
 	protocols map[string]ProtocolAdapter
 	sqsClient sqsproto.Client
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 }
 
-func New(cfg Config, store *memory.Store, clock util.Clock, signer *signing.Provider, httpAdapter *httpproto.Adapter, sqsClient sqsproto.Client) *Service {
+func New(cfg Config, store storepkg.Store, clock util.Clock, signer *signing.Provider, httpAdapter *httpproto.Adapter, sqsClient sqsproto.Client) *Service {
 	svc := &Service{
 		cfg:       cfg,
 		store:     store,
@@ -51,16 +55,19 @@ func New(cfg Config, store *memory.Store, clock util.Clock, signer *signing.Prov
 		signer:    signer,
 		protocols: map[string]ProtocolAdapter{},
 		sqsClient: sqsClient,
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 	}
 	if httpAdapter != nil {
 		for _, protocol := range httpAdapter.Protocols() {
 			svc.protocols[protocol] = httpAdapter
 		}
 	}
+	go svc.runDeliveryWorker()
 	return svc
 }
 
-func (s *Service) CreateTopic(ctx context.Context, identity domain.Identity, name string, attrs map[string]string) (*domain.Topic, bool, error) {
+func (s *Service) CreateTopic(ctx context.Context, identity domain.Identity, name string, attrs, tags map[string]string) (*domain.Topic, bool, error) {
 	fifo := strings.EqualFold(attrs["FifoTopic"], "true")
 	if err := util.ValidateTopicName(name, fifo); err != nil {
 		return nil, false, domain.NewInvalidParameter("%s", err.Error())
@@ -76,7 +83,7 @@ func (s *Service) CreateTopic(ctx context.Context, identity domain.Identity, nam
 		Region:         s.cfg.Region,
 		CreatedAt:      now,
 		UpdatedAt:      now,
-		Tags:           map[string]string{},
+		Tags:           cloneStringMap(tags),
 		Subscriptions:  map[string]struct{}{},
 		GroupSequences: map[string]domain.SequenceState{},
 		DedupRecords:   map[string]domain.DedupRecord{},
@@ -91,6 +98,9 @@ func (s *Service) CreateTopic(ctx context.Context, identity domain.Identity, nam
 	}
 	if err := s.applyTopicAttributes(topic, attrs, true); err != nil {
 		return nil, false, err
+	}
+	if len(topic.Tags) > 50 {
+		return nil, false, &domain.APIError{Code: "TagLimitExceeded", Message: "Can't add more than 50 tags to a topic.", HTTPStatus: 400, Sender: true}
 	}
 	if err := s.store.CreateTopic(topic); err != nil {
 		return nil, false, err
@@ -153,9 +163,7 @@ func (s *Service) TagTopic(ctx context.Context, identity domain.Identity, topicA
 		if topic.Tags == nil {
 			topic.Tags = map[string]string{}
 		}
-		for k, v := range tags {
-			topic.Tags[k] = v
-		}
+		maps.Copy(topic.Tags, tags)
 		return nil
 	})
 	return err
@@ -267,9 +275,7 @@ func (s *Service) Subscribe(ctx context.Context, identity domain.Identity, topic
 	if _, effective, err := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy); err == nil {
 		sub.Attributes.EffectiveDeliveryPolicy = effective
 	}
-	if err := s.store.CreateSubscription(sub); err != nil {
-		return "", err
-	}
+	var confirmationJob *domain.DeliveryJob
 	if protocolName != domain.ProtocolSQS {
 		token := domain.ConfirmationToken{
 			Token:                     util.RandomHex(160),
@@ -281,8 +287,28 @@ func (s *Service) Subscribe(ctx context.Context, identity domain.Identity, topic
 			AuthenticateOnUnsubscribe: false,
 			Kind:                      "subscribe",
 		}
-		s.store.PutConfirmationToken(token)
-		go s.sendConfirmation(context.Background(), topic, sub, token)
+		attempt, effectiveJSON, err := s.buildConfirmationAttempt(topic, sub, token, "SubscriptionConfirmation")
+		if err != nil {
+			return "", err
+		}
+		confirmationJob, err = s.prepareDeliveryJob("subscription_confirmation", attempt, effectiveJSON, false, "")
+		if err != nil {
+			return "", err
+		}
+		err = s.store.Tx(ctx, func(tx storepkg.Tx) error {
+			if err := tx.CreateSubscription(sub); err != nil {
+				return err
+			}
+			tx.PutConfirmationToken(token)
+			return tx.EnqueueDeliveryJob(confirmationJob)
+		})
+		if err != nil {
+			return "", err
+		}
+	} else {
+		if err := s.store.CreateSubscription(sub); err != nil {
+			return "", err
+		}
 	}
 	if sub.PendingConfirmation && !returnSubscriptionARN {
 		return "pending confirmation", nil
@@ -342,10 +368,6 @@ func (s *Service) Unsubscribe(ctx context.Context, identity domain.Identity, sub
 	if err != nil {
 		return domain.NewNotFound("Topic does not exist")
 	}
-	_, err = s.store.DeleteSubscription(subscriptionARN)
-	if err != nil {
-		return domain.NewNotFound("Subscription does not exist")
-	}
 	if sub.Protocol == domain.ProtocolHTTP || sub.Protocol == domain.ProtocolHTTPS {
 		token := domain.ConfirmationToken{
 			Token:                     util.RandomHex(160),
@@ -358,8 +380,25 @@ func (s *Service) Unsubscribe(ctx context.Context, identity domain.Identity, sub
 			Kind:                      "unsubscribe",
 			Restore:                   sub,
 		}
-		s.store.PutConfirmationToken(token)
-		go s.sendUnsubscribeConfirmation(context.Background(), topic, sub, token)
+		attempt, effectiveJSON, err := s.buildConfirmationAttempt(topic, sub, token, "UnsubscribeConfirmation")
+		if err != nil {
+			return err
+		}
+		job, err := s.prepareDeliveryJob("unsubscribe_confirmation", attempt, effectiveJSON, false, "")
+		if err != nil {
+			return err
+		}
+		return s.store.Tx(ctx, func(tx storepkg.Tx) error {
+			if _, err := tx.DeleteSubscription(subscriptionARN); err != nil {
+				return domain.NewNotFound("Subscription does not exist")
+			}
+			tx.PutConfirmationToken(token)
+			return tx.EnqueueDeliveryJob(job)
+		})
+	}
+	_, err = s.store.DeleteSubscription(subscriptionARN)
+	if err != nil {
+		return domain.NewNotFound("Subscription does not exist")
 	}
 	return nil
 }
@@ -520,30 +559,68 @@ func (s *Service) PublishBatch(ctx context.Context, identity domain.Identity, to
 }
 
 func (s *Service) dispatchPublish(ctx context.Context, topic *domain.Topic, input domain.PublishInput, messageID, dedupID, sequenceNumber string) error {
-	subs, _ := s.store.ListSubscriptionsByTopic(topic.ARN, "", 10_000)
 	selectedMessages, err := resolveProtocolMessages(input.Message, input.MessageStructure)
 	if err != nil {
 		return domain.NewInvalidParameter("%s", err.Error())
 	}
-	for _, sub := range subs {
-		if !sub.Confirmed || sub.PendingConfirmation {
-			continue
-		}
-		matched, err := filter.Matches(sub.Attributes.FilterPolicy, sub.Attributes.FilterPolicyScope, selectedMessages["default"], input.MessageAttributes)
-		if err != nil || !matched {
-			continue
-		}
-		protocolMessage := selectedMessages[sub.Protocol]
-		if protocolMessage == "" {
-			protocolMessage = selectedMessages["default"]
-		}
-		if sub.Protocol == domain.ProtocolSQS {
-			if err := s.deliverToSQS(ctx, topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber); err != nil {
-				s.redrive(ctx, topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber)
+	type sqsDelivery struct {
+		topic           *domain.Topic
+		sub             *domain.Subscription
+		protocolMessage string
+	}
+	var sqsDeliveries []sqsDelivery
+	err = s.store.Tx(ctx, func(tx storepkg.Tx) error {
+		subs, _ := tx.ListSubscriptionsByTopic(topic.ARN, "", 10_000)
+		for _, sub := range subs {
+			if !sub.Confirmed || sub.PendingConfirmation {
+				continue
 			}
-			continue
+			matched, err := filter.Matches(sub.Attributes.FilterPolicy, sub.Attributes.FilterPolicyScope, selectedMessages["default"], input.MessageAttributes)
+			if err != nil || !matched {
+				continue
+			}
+			protocolMessage := selectedMessages[sub.Protocol]
+			if protocolMessage == "" {
+				protocolMessage = selectedMessages["default"]
+			}
+			if sub.Protocol == domain.ProtocolSQS {
+				sqsDeliveries = append(sqsDeliveries, sqsDelivery{
+					topic:           domain.CopyTopic(topic),
+					sub:             domain.CopySubscription(sub),
+					protocolMessage: protocolMessage,
+				})
+				continue
+			}
+			attempt, effectiveJSON, err := s.buildNotificationAttempt(topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber)
+			if err != nil {
+				return err
+			}
+			job, err := s.prepareDeliveryJob("notification", attempt, effectiveJSON, sub.Attributes.RawMessageDelivery, sub.Attributes.RedrivePolicy)
+			if err != nil {
+				return err
+			}
+			if err := tx.EnqueueDeliveryJob(job); err != nil {
+				return err
+			}
 		}
-		go s.deliverToHTTP(context.Background(), topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, item := range sqsDeliveries {
+		if err := s.deliverToSQS(ctx, item.topic, item.sub, item.protocolMessage, input, messageID, dedupID, sequenceNumber); err != nil {
+			payload := domain.DeliveryJobPayload{
+				TopicARN:        item.topic.ARN,
+				SubscriptionARN: item.sub.ARN,
+				ProtocolMessage: item.protocolMessage,
+				Timestamp:       s.clock.Now(),
+				MessageID:       messageID,
+				GroupID:         input.MessageGroupID,
+				DeduplicationID: dedupID,
+			}
+			s.redrivePayload(ctx, payload, item.sub.Attributes.RedrivePolicy)
+		}
 	}
 	return nil
 }
@@ -562,6 +639,13 @@ func (s *Service) deliverToSQS(ctx context.Context, topic *domain.Topic, sub *do
 	body := protocolMessage
 	attrs := map[string]sqsproto.MessageAttribute{}
 	if !sub.Attributes.RawMessageDelivery {
+		signature := ""
+		attempt, _, err := s.buildNotificationAttempt(topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber)
+		if err == nil && attempt != nil {
+			if sig, signErr := s.signer.Sign(attempt); signErr == nil {
+				signature = sig
+			}
+		}
 		envelope := map[string]any{
 			"Type":             "Notification",
 			"MessageId":        messageID,
@@ -569,8 +653,10 @@ func (s *Service) deliverToSQS(ctx context.Context, topic *domain.Topic, sub *do
 			"Message":          protocolMessage,
 			"Timestamp":        domain.DefaultTimestamp(s.clock.Now()),
 			"SignatureVersion": topic.Attributes.SignatureVersion,
+			"Signature":        signature,
 			"SigningCertURL":   s.signer.SigningCertURL(s.cfg.BaseURL),
 			"UnsubscribeURL":   fmt.Sprintf("%s/?Action=Unsubscribe&SubscriptionArn=%s", strings.TrimRight(s.cfg.BaseURL, "/"), sub.ARN),
+			"SubscriptionArn":  sub.ARN,
 		}
 		if input.Subject != "" {
 			envelope["Subject"] = input.Subject
@@ -597,14 +683,10 @@ func (s *Service) deliverToSQS(ctx context.Context, topic *domain.Topic, sub *do
 	})
 }
 
-func (s *Service) deliverToHTTP(ctx context.Context, topic *domain.Topic, sub *domain.Subscription, protocolMessage string, input domain.PublishInput, messageID, dedupID, sequenceNumber string) {
-	adapter, ok := s.protocols[sub.Protocol]
-	if !ok {
-		return
-	}
-	subPolicy, _, err := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy)
+func (s *Service) buildNotificationAttempt(topic *domain.Topic, sub *domain.Subscription, protocolMessage string, input domain.PublishInput, messageID, dedupID, sequenceNumber string) (*domain.DeliveryAttempt, string, error) {
+	_, effectiveJSON, err := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy)
 	if err != nil {
-		return
+		return nil, "", err
 	}
 	attempt := &domain.DeliveryAttempt{
 		Subscription:      sub,
@@ -623,107 +705,31 @@ func (s *Service) deliverToHTTP(ctx context.Context, topic *domain.Topic, sub *d
 		DeduplicationID:   dedupID,
 		SequenceNumber:    sequenceNumber,
 	}
-	signature, err := s.signer.Sign(attempt)
-	if err == nil {
-		attempt.Signature = signature
-	}
-	result := adapter.Deliver(ctx, attempt, subPolicy, sub.Attributes.RawMessageDelivery)
-	if result.Success || !result.Retryable {
-		if !result.Success {
-			s.redrive(ctx, topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber)
-		}
-		return
-	}
-	delays, err := delivery.RetryDelays(subPolicy)
+	return attempt, effectiveJSON, nil
+}
+
+func (s *Service) buildConfirmationAttempt(topic *domain.Topic, sub *domain.Subscription, token domain.ConfirmationToken, messageType string) (*domain.DeliveryAttempt, string, error) {
+	_, effectiveJSON, err := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy)
 	if err != nil {
-		return
+		return nil, "", err
 	}
-	for _, delay := range delays {
-		<-s.clock.After(delay)
-		result = adapter.Deliver(context.Background(), attempt, subPolicy, sub.Attributes.RawMessageDelivery)
-		if result.Success {
-			return
-		}
-		if !result.Retryable {
-			break
-		}
+	message := "You have chosen to subscribe to the topic. To confirm the subscription, visit the SubscribeURL included in this message."
+	if messageType == "UnsubscribeConfirmation" {
+		message = fmt.Sprintf("You have chosen to deactivate subscription %s.\nTo cancel this operation and restore the subscription, visit the SubscribeURL included in this message.", sub.ARN)
 	}
-	s.redrive(ctx, topic, sub, protocolMessage, input, messageID, dedupID, sequenceNumber)
-}
-
-func (s *Service) redrive(ctx context.Context, topic *domain.Topic, sub *domain.Subscription, protocolMessage string, input domain.PublishInput, messageID, dedupID, sequenceNumber string) {
-	if s.sqsClient == nil || strings.TrimSpace(sub.Attributes.RedrivePolicy) == "" {
-		return
-	}
-	rp, err := domain.ParseRedrivePolicy(sub.Attributes.RedrivePolicy)
-	if err != nil || rp.DeadLetterTargetArn == "" {
-		return
-	}
-	envelope := map[string]any{
-		"Type":            "Notification",
-		"MessageId":       messageID,
-		"TopicArn":        topic.ARN,
-		"Message":         protocolMessage,
-		"Timestamp":       domain.DefaultTimestamp(s.clock.Now()),
-		"SubscriptionArn": sub.ARN,
-	}
-	body, _ := json.Marshal(envelope)
-	_ = s.sqsClient.SendMessage(ctx, sqsproto.SendRequest{
-		QueueARN:               rp.DeadLetterTargetArn,
-		Body:                   string(body),
-		MessageGroupID:         input.MessageGroupID,
-		MessageDeduplicationID: dedupID,
-	})
-}
-
-func (s *Service) sendConfirmation(ctx context.Context, topic *domain.Topic, sub *domain.Subscription, token domain.ConfirmationToken) {
-	adapter, ok := s.protocols[sub.Protocol]
-	if !ok {
-		return
-	}
-	policyValue, _, _ := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy)
 	attempt := &domain.DeliveryAttempt{
 		Subscription:     sub,
 		Topic:            topic,
 		MessageID:        util.UUID(),
-		ProtocolMessage:  "You have chosen to subscribe to the topic. To confirm the subscription, visit the SubscribeURL included in this message.",
+		ProtocolMessage:  message,
 		Timestamp:        s.clock.Now(),
-		Type:             "SubscriptionConfirmation",
+		Type:             messageType,
 		Token:            token.Token,
 		SubscribeURL:     fmt.Sprintf("%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s", strings.TrimRight(s.cfg.BaseURL, "/"), topic.ARN, token.Token),
 		SignatureVersion: topic.Attributes.SignatureVersion,
 		SigningCertURL:   s.signer.SigningCertURL(s.cfg.BaseURL),
 	}
-	signature, err := s.signer.Sign(attempt)
-	if err == nil {
-		attempt.Signature = signature
-	}
-	_ = adapter.Deliver(ctx, attempt, policyValue, false)
-}
-
-func (s *Service) sendUnsubscribeConfirmation(ctx context.Context, topic *domain.Topic, sub *domain.Subscription, token domain.ConfirmationToken) {
-	adapter, ok := s.protocols[sub.Protocol]
-	if !ok {
-		return
-	}
-	policyValue, _, _ := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy)
-	attempt := &domain.DeliveryAttempt{
-		Subscription:     sub,
-		Topic:            topic,
-		MessageID:        util.UUID(),
-		ProtocolMessage:  fmt.Sprintf("You have chosen to deactivate subscription %s.\nTo cancel this operation and restore the subscription, visit the SubscribeURL included in this message.", sub.ARN),
-		Timestamp:        s.clock.Now(),
-		Type:             "UnsubscribeConfirmation",
-		Token:            token.Token,
-		SubscribeURL:     fmt.Sprintf("%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s", strings.TrimRight(s.cfg.BaseURL, "/"), topic.ARN, token.Token),
-		SignatureVersion: topic.Attributes.SignatureVersion,
-		SigningCertURL:   s.signer.SigningCertURL(s.cfg.BaseURL),
-	}
-	signature, err := s.signer.Sign(attempt)
-	if err == nil {
-		attempt.Signature = signature
-	}
-	_ = adapter.Deliver(ctx, attempt, policyValue, false)
+	return attempt, effectiveJSON, nil
 }
 
 func (s *Service) authorizeTopic(identity domain.Identity, topic *domain.Topic, action string) error {
@@ -795,11 +801,20 @@ func (s *Service) applyTopicAttributes(topic *domain.Topic, attrs map[string]str
 			topic.Attributes.TracingConfig = value
 		case "DisplayName":
 			topic.Attributes.DisplayName = value
-		default:
+		case "KmsMasterKeyId",
+			"HTTPSuccessFeedbackRoleArn", "HTTPSuccessFeedbackSampleRate", "HTTPFailureFeedbackRoleArn",
+			"SQSSuccessFeedbackRoleArn", "SQSSuccessFeedbackSampleRate", "SQSFailureFeedbackRoleArn",
+			"LambdaSuccessFeedbackRoleArn", "LambdaSuccessFeedbackSampleRate", "LambdaFailureFeedbackRoleArn",
+			"FirehoseSuccessFeedbackRoleArn", "FirehoseSuccessFeedbackSampleRate", "FirehoseFailureFeedbackRoleArn",
+			"ApplicationSuccessFeedbackRoleArn", "ApplicationSuccessFeedbackSampleRate", "ApplicationFailureFeedbackRoleArn":
 			if topic.Attributes.Unsupported == nil {
 				topic.Attributes.Unsupported = map[string]string{}
 			}
 			topic.Attributes.Unsupported[name] = value
+		case "DataProtectionPolicy":
+			return domain.NewInvalidParameter("Invalid parameter: DataProtectionPolicy")
+		default:
+			return domain.NewInvalidParameter("Invalid parameter: %s", name)
 		}
 	}
 	topic.UpdatedAt = s.clock.Now()
@@ -811,8 +826,7 @@ func (s *Service) applySubscriptionAttributes(sub *domain.Subscription, topic *d
 		switch name {
 		case "DeliveryPolicy":
 			if sub.Protocol != domain.ProtocolHTTP && sub.Protocol != domain.ProtocolHTTPS {
-				sub.Attributes.DeliveryPolicy = value
-				continue
+				return domain.NewInvalidParameter("Invalid parameter: DeliveryPolicy")
 			}
 			if err := delivery.ValidateSubscriptionPolicy(value); err != nil {
 				return domain.NewInvalidParameter("Invalid parameter: DeliveryPolicy")
@@ -838,6 +852,10 @@ func (s *Service) applySubscriptionAttributes(sub *domain.Subscription, topic *d
 				return domain.NewInvalidParameter("Invalid parameter: RedrivePolicy")
 			}
 			sub.Attributes.RedrivePolicy = value
+		case "ReplayPolicy", "ReplayStatus":
+			return domain.NewInvalidParameter("Invalid parameter: %s", name)
+		default:
+			return domain.NewInvalidParameter("Invalid parameter: %s", name)
 		}
 	}
 	if _, effective, err := delivery.EffectivePolicy(topic.Attributes.DeliveryPolicy, sub.Attributes.DeliveryPolicy); err == nil {
@@ -852,6 +870,9 @@ func (s *Service) validateSQSSubscription(ctx context.Context, topic *domain.Top
 	}
 	queue, err := s.sqsClient.ResolveQueue(ctx, sub.Endpoint)
 	if err != nil {
+		return domain.NewInvalidParameter("Invalid parameter: Endpoint")
+	}
+	if queue.Region != topic.Region {
 		return domain.NewInvalidParameter("Invalid parameter: Endpoint")
 	}
 	if topic.Attributes.FifoTopic {
@@ -922,7 +943,7 @@ func validateMessageAttributes(attrs map[string]domain.MessageAttributeValue) er
 	return nil
 }
 
-func resolveProtocolMessages(message string, structure string) (map[string]string, error) {
+func resolveProtocolMessages(message, structure string) (map[string]string, error) {
 	if structure == "" {
 		return map[string]string{"default": message}, nil
 	}

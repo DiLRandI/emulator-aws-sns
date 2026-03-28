@@ -71,7 +71,7 @@ func Marshal(doc Document) string {
 	return string(data)
 }
 
-func AddPermission(raw string, label string, accountIDs []string, actionNames []string, topicARN string) (string, error) {
+func AddPermission(raw, label string, accountIDs, actionNames []string, topicARN string) (string, error) {
 	doc, err := Parse(raw)
 	if err != nil {
 		return "", err
@@ -103,7 +103,7 @@ func AddPermission(raw string, label string, accountIDs []string, actionNames []
 	return Marshal(doc), nil
 }
 
-func RemovePermission(raw string, label string) (string, error) {
+func RemovePermission(raw, label string) (string, error) {
 	doc, err := Parse(raw)
 	if err != nil {
 		return "", err

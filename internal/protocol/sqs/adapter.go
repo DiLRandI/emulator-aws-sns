@@ -41,7 +41,7 @@ type SendRequest struct {
 type Client interface {
 	ResolveQueue(ctx context.Context, queueARN string) (QueueAttributes, error)
 	SendMessage(ctx context.Context, req SendRequest) error
-	QueueAllowsTopic(ctx context.Context, queueARN string, topicARN string, topicOwner string) (bool, error)
+	QueueAllowsTopic(ctx context.Context, queueARN, topicARN, topicOwner string) (bool, error)
 }
 
 type HTTPClient struct {
@@ -111,10 +111,10 @@ func (c *HTTPClient) SendMessage(ctx context.Context, req SendRequest) error {
 		"QueueUrl":    {queue.URL},
 		"MessageBody": {req.Body},
 	}
+	if req.MessageGroupID != "" {
+		values.Set("MessageGroupId", req.MessageGroupID)
+	}
 	if queue.FIFO {
-		if req.MessageGroupID != "" {
-			values.Set("MessageGroupId", req.MessageGroupID)
-		}
 		if req.MessageDeduplicationID != "" {
 			values.Set("MessageDeduplicationId", req.MessageDeduplicationID)
 		}
@@ -136,7 +136,7 @@ func (c *HTTPClient) SendMessage(ctx context.Context, req SendRequest) error {
 	return err
 }
 
-func (c *HTTPClient) QueueAllowsTopic(ctx context.Context, queueARN string, topicARN string, topicOwner string) (bool, error) {
+func (c *HTTPClient) QueueAllowsTopic(ctx context.Context, queueARN, topicARN, topicOwner string) (bool, error) {
 	queue, err := c.ResolveQueue(ctx, queueARN)
 	if err != nil {
 		return false, err
@@ -174,7 +174,7 @@ func (c *HTTPClient) do(ctx context.Context, endpoint string, values url.Values)
 	return io.ReadAll(resp.Body)
 }
 
-func readTag(body string, tag string) string {
+func readTag(body, tag string) string {
 	start := "<" + tag + ">"
 	end := "</" + tag + ">"
 	si := strings.Index(body, start)

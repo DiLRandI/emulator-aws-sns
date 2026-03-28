@@ -172,10 +172,7 @@ func RetryDelays(policy SubscriptionPolicy) ([]time.Duration, error) {
 	if rp.MinDelayTarget <= 0 || rp.MaxDelayTarget <= 0 || rp.MinDelayTarget > rp.MaxDelayTarget {
 		return nil, fmt.Errorf("invalid delay configuration")
 	}
-	backoffRetries := rp.NumRetries - rp.NumNoDelayRetries - rp.NumMinDelayRetries - rp.NumMaxDelayRetries
-	if backoffRetries < 0 {
-		backoffRetries = 0
-	}
+	backoffRetries := max(rp.NumRetries-rp.NumNoDelayRetries-rp.NumMinDelayRetries-rp.NumMaxDelayRetries, 0)
 	var out []time.Duration
 	for i := 0; i < rp.NumNoDelayRetries; i++ {
 		out = append(out, 0)
@@ -211,7 +208,7 @@ func backoffDelay(policy RetryPolicy, attempt, total int) int {
 		return int(value)
 	case "exponential":
 		value := float64(policy.MinDelayTarget)
-		for i := 0; i < attempt; i++ {
+		for range attempt {
 			value *= 2
 			if int(value) >= policy.MaxDelayTarget {
 				return policy.MaxDelayTarget

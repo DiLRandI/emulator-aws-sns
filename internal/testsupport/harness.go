@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,11 +22,14 @@ import (
 	snssdk "github.com/aws/aws-sdk-go-v2/service/sns"
 
 	"emulator-aws-sns/internal/api"
+	"emulator-aws-sns/internal/auth"
 	httpproto "emulator-aws-sns/internal/protocol/http"
 	sqsproto "emulator-aws-sns/internal/protocol/sqs"
 	"emulator-aws-sns/internal/service"
 	"emulator-aws-sns/internal/signing"
+	storepkg "emulator-aws-sns/internal/store"
 	"emulator-aws-sns/internal/store/memory"
+	sqlitestore "emulator-aws-sns/internal/store/sqlite"
 	"emulator-aws-sns/internal/util"
 )
 
@@ -39,41 +43,108 @@ type Harness struct {
 	Server *httptest.Server
 	SQS    *FakeSQS
 
-	service *service.Service
+	service    *service.Service
+	sqlitePath string
+	httpClient *http.Client
 }
 
 func NewHarness(t testing.TB) *Harness {
 	t.Helper()
-	signer, err := signing.NewProvider("/__sns/certs/current.pem")
-	if err != nil {
-		t.Fatalf("signing.NewProvider() error = %v", err)
-	}
-	sqs := NewFakeSQS(t, DefaultRegion, DefaultAccountID)
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	return newHarness(t, "")
+}
+
+func NewSQLiteHarness(t testing.TB) *Harness {
+	t.Helper()
+	return newHarness(t, filepath.Join(t.TempDir(), "sns.sqlite"))
+}
+
+func newHarness(t testing.TB, sqlitePath string) *Harness {
+	t.Helper()
+	h := &Harness{
+		T:          t,
+		SQS:        NewFakeSQS(t, DefaultRegion, DefaultAccountID),
+		sqlitePath: sqlitePath,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
 		},
+	}
+	h.start()
+	t.Cleanup(func() {
+		h.Close()
+	})
+	return h
+}
+
+func (h *Harness) Restart() {
+	h.T.Helper()
+	if h.service != nil {
+		_ = h.service.Close()
+	}
+	if h.Server != nil {
+		h.Server.Close()
+	}
+	h.start()
+}
+
+func (h *Harness) Close() {
+	if h.service != nil {
+		_ = h.service.Close()
+		h.service = nil
+	}
+	if h.Server != nil {
+		h.Server.Close()
+		h.Server = nil
+	}
+	if h.SQS != nil {
+		h.SQS.Close()
+		h.SQS = nil
+	}
+}
+
+func (h *Harness) start() {
+	h.T.Helper()
+	store, err := h.openStore()
+	if err != nil {
+		h.T.Fatalf("openStore() error = %v", err)
+	}
+	material, err := store.LoadSigningMaterial()
+	if err != nil {
+		h.T.Fatalf("store.LoadSigningMaterial() error = %v", err)
+	}
+	signer, err := signing.NewProviderFromMaterial("/__sns/certs/current.pem", material)
+	if err != nil {
+		h.T.Fatalf("signing.NewProviderFromMaterial() error = %v", err)
+	}
+	if len(material.CertPEM) == 0 {
+		fresh, err := signer.Material()
+		if err != nil {
+			h.T.Fatalf("signer.Material() error = %v", err)
+		}
+		if err := store.SaveSigningMaterial(fresh); err != nil {
+			h.T.Fatalf("store.SaveSigningMaterial() error = %v", err)
+		}
 	}
 	svc := service.New(service.Config{
 		Region:    DefaultRegion,
 		AccountID: DefaultAccountID,
 		BaseURL:   "http://127.0.0.1:0",
 		PageSize:  100,
-	}, memory.NewStore(), util.RealClock{}, signer, httpproto.NewAdapter(httpClient), sqsproto.NewHTTPClient(sqs.Endpoint(), http.DefaultClient))
-	server := httptest.NewServer(api.New(svc, signer, DefaultAccountID).Routes())
+	}, store, util.RealClock{}, signer, httpproto.NewAdapter(h.httpClient), sqsproto.NewHTTPClient(h.SQS.Endpoint(), http.DefaultClient))
+	verifier := auth.NewVerifier(DefaultAccountID, DefaultRegion, auth.ModeStrict, []auth.Credential{{AccessKeyID: "test", SecretAccessKey: "test", SessionToken: "test"}})
+	server := httptest.NewServer(api.New(svc, signer, verifier).Routes())
 	svc.SetBaseURL(server.URL)
-	h := &Harness{
-		T:       t,
-		Server:  server,
-		SQS:     sqs,
-		service: svc,
+	h.service = svc
+	h.Server = server
+}
+
+func (h *Harness) openStore() (storepkg.Store, error) {
+	if h.sqlitePath == "" {
+		return memory.NewStore(), nil
 	}
-	t.Cleanup(func() {
-		server.Close()
-		sqs.Close()
-	})
-	return h
+	return sqlitestore.Open(h.sqlitePath)
 }
 
 func (h *Harness) SNSClient(ctx context.Context) *snssdk.Client {

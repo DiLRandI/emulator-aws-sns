@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"emulator-aws-sns/internal/auth"
 	"emulator-aws-sns/internal/delivery"
 	"emulator-aws-sns/internal/domain"
 	"emulator-aws-sns/internal/service"
@@ -22,19 +24,21 @@ import (
 const xmlNS = "https://sns.amazonaws.com/doc/2010-03-31/"
 
 type Server struct {
-	service   *service.Service
-	signer    *signing.Provider
-	accountID string
+	service  *service.Service
+	signer   *signing.Provider
+	verifier *auth.Verifier
 }
 
-func New(service *service.Service, signer *signing.Provider, accountID string) *Server {
-	return &Server{service: service, signer: signer, accountID: accountID}
+func New(service *service.Service, signer *signing.Provider, verifier *auth.Verifier) *Server {
+	return &Server{service: service, signer: signer, verifier: verifier}
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/__sns/certs/current.pem", s.handleCert)
+	mux.HandleFunc("/__health", s.handleHealth)
+	mux.HandleFunc("/__ready", s.handleReady)
 	return mux
 }
 
@@ -43,7 +47,27 @@ func (s *Server) handleCert(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(s.signer.CertPEM())
 }
 
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.Health(r.Context()); err != nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
+}
+
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeError(w, r, &domain.APIError{Code: "InvalidParameter", Message: "Unable to parse request", HTTPStatus: 400, Sender: true})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
 	if err := r.ParseForm(); err != nil {
 		s.writeError(w, r, &domain.APIError{Code: "InvalidParameter", Message: "Unable to parse request", HTTPStatus: 400, Sender: true})
 		return
@@ -54,8 +78,17 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	identity := domain.Identity{AccountID: s.accountID, Principal: s.accountID}
-	var err error
+	allowAnonymous := action == "ConfirmSubscription" && !strings.EqualFold(r.Form.Get("AuthenticateOnUnsubscribe"), "true")
+	identity, err := s.verifier.Verify(r, body, allowAnonymous)
+	if err != nil {
+		var apiErr *domain.APIError
+		if errorAs(err, &apiErr) {
+			s.writeError(w, r, apiErr)
+			return
+		}
+		s.writeError(w, r, &domain.APIError{Code: "InvalidSecurity", Message: err.Error(), HTTPStatus: http.StatusForbidden, Sender: true})
+		return
+	}
 	switch action {
 	case "CreateTopic":
 		err = s.createTopic(ctx, w, r, identity)
@@ -108,7 +141,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createTopic(ctx context.Context, w http.ResponseWriter, r *http.Request, identity domain.Identity) error {
-	topic, _, err := s.service.CreateTopic(ctx, identity, r.Form.Get("Name"), parseAttributes(r))
+	topic, _, err := s.service.CreateTopic(ctx, identity, r.Form.Get("Name"), parseAttributes(r), parseTags(r))
 	if err != nil {
 		return err
 	}

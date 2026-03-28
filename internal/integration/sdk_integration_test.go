@@ -322,6 +322,75 @@ func TestSDKHTTPAndHTTPSSubscriptions(t *testing.T) {
 	}
 }
 
+func TestSDKSQLitePersistenceAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	h := testsupport.NewSQLiteHarness(t)
+	client := h.SNSClient(ctx)
+	queueARN := h.SQS.AddQueue("persist-orders.fifo", true)
+
+	topic, err := client.CreateTopic(ctx, &snssdk.CreateTopicInput{
+		Name: aws.String("persist-orders.fifo"),
+		Attributes: map[string]string{
+			"FifoTopic":                 "true",
+			"ContentBasedDeduplication": "false",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTopic() error = %v", err)
+	}
+	sub, err := client.Subscribe(ctx, &snssdk.SubscribeInput{
+		TopicArn:              topic.TopicArn,
+		Protocol:              aws.String("sqs"),
+		Endpoint:              aws.String(queueARN),
+		ReturnSubscriptionArn: true,
+		Attributes: map[string]string{
+			"RawMessageDelivery": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+	if _, err := client.Publish(ctx, &snssdk.PublishInput{
+		TopicArn:               topic.TopicArn,
+		Message:                aws.String("persist-1"),
+		MessageGroupId:         aws.String("group-a"),
+		MessageDeduplicationId: aws.String("dedup-a"),
+	}); err != nil {
+		t.Fatalf("Publish(before restart) error = %v", err)
+	}
+
+	h.Restart()
+	client = h.SNSClient(ctx)
+	if len(h.SQS.Messages(queueARN)) != 1 {
+		t.Fatalf("expected one SQS message before post-restart publish, got %d", len(h.SQS.Messages(queueARN)))
+	}
+	attrs, err := client.GetTopicAttributes(ctx, &snssdk.GetTopicAttributesInput{TopicArn: topic.TopicArn})
+	if err != nil {
+		t.Fatalf("GetTopicAttributes(after restart) error = %v", err)
+	}
+	if attrs.Attributes["FifoTopic"] != "true" {
+		t.Fatalf("expected persisted topic attributes after restart, got %#v", attrs.Attributes)
+	}
+	listed, err := client.ListSubscriptionsByTopic(ctx, &snssdk.ListSubscriptionsByTopicInput{TopicArn: topic.TopicArn})
+	if err != nil {
+		t.Fatalf("ListSubscriptionsByTopic(after restart) error = %v", err)
+	}
+	if len(listed.Subscriptions) != 1 || aws.ToString(listed.Subscriptions[0].SubscriptionArn) != aws.ToString(sub.SubscriptionArn) {
+		t.Fatalf("expected persisted subscription after restart, got %#v", listed.Subscriptions)
+	}
+	if _, err := client.Publish(ctx, &snssdk.PublishInput{
+		TopicArn:               topic.TopicArn,
+		Message:                aws.String("persist-1"),
+		MessageGroupId:         aws.String("group-a"),
+		MessageDeduplicationId: aws.String("dedup-a"),
+	}); err != nil {
+		t.Fatalf("Publish(after restart) error = %v", err)
+	}
+	if len(h.SQS.Messages(queueARN)) != 1 {
+		t.Fatalf("expected dedup state to survive restart, got %d messages", len(h.SQS.Messages(queueARN)))
+	}
+}
+
 func TestSDKSQSAndFIFO(t *testing.T) {
 	ctx := context.Background()
 	h := testsupport.NewHarness(t)

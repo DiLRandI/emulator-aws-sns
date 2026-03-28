@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"emulator-aws-sns/internal/domain"
@@ -9,6 +10,7 @@ import (
 	sqsproto "emulator-aws-sns/internal/protocol/sqs"
 	"emulator-aws-sns/internal/signing"
 	"emulator-aws-sns/internal/store/memory"
+	sqlitestore "emulator-aws-sns/internal/store/sqlite"
 	"emulator-aws-sns/internal/util"
 )
 
@@ -39,7 +41,7 @@ func TestFIFOPublishDeduplicatesForSQS(t *testing.T) {
 	queueARN := "arn:aws:sqs:us-east-1:123456789012:orders.fifo"
 	fake := &fakeSQS{
 		queues: map[string]sqsproto.QueueAttributes{
-			queueARN: {ARN: queueARN, FIFO: true, Policy: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"SQS:SendMessage","Resource":"arn:aws:sqs:us-east-1:123456789012:orders.fifo","Condition":{"ArnEquals":{"aws:SourceArn":"arn:aws:sns:us-east-1:123456789012:orders.fifo"}}}]}`},
+			queueARN: {ARN: queueARN, FIFO: true, Region: "us-east-1", Policy: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"SQS:SendMessage","Resource":"arn:aws:sqs:us-east-1:123456789012:orders.fifo","Condition":{"ArnEquals":{"aws:SourceArn":"arn:aws:sns:us-east-1:123456789012:orders.fifo"}}}]}`},
 		},
 		allowed: true,
 	}
@@ -53,7 +55,7 @@ func TestFIFOPublishDeduplicatesForSQS(t *testing.T) {
 	topic, _, err := svc.CreateTopic(context.Background(), testIdentity(), "orders.fifo", map[string]string{
 		"FifoTopic":                 "true",
 		"ContentBasedDeduplication": "false",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("CreateTopic() error = %v", err)
 	}
@@ -97,16 +99,90 @@ func TestRejectStandardTopicToFIFOQueue(t *testing.T) {
 	}
 	queueARN := "arn:aws:sqs:us-east-1:123456789012:orders.fifo"
 	fake := &fakeSQS{
-		queues:  map[string]sqsproto.QueueAttributes{queueARN: {ARN: queueARN, FIFO: true}},
+		queues:  map[string]sqsproto.QueueAttributes{queueARN: {ARN: queueARN, FIFO: true, Region: "us-east-1"}},
 		allowed: true,
 	}
 	svc := New(Config{Region: "us-east-1", AccountID: "123456789012", BaseURL: "http://localhost:4100"}, memory.NewStore(), util.RealClock{}, signer, httpproto.NewAdapter(nil), fake)
-	topic, _, err := svc.CreateTopic(context.Background(), testIdentity(), "orders", nil)
+	topic, _, err := svc.CreateTopic(context.Background(), testIdentity(), "orders", nil, nil)
 	if err != nil {
 		t.Fatalf("CreateTopic() error = %v", err)
 	}
 	if _, err := svc.Subscribe(context.Background(), testIdentity(), topic.ARN, "sqs", queueARN, nil, true); err == nil {
 		t.Fatalf("expected standard topic -> FIFO queue subscription to fail")
+	}
+}
+
+func TestFIFODedupSurvivesSQLiteRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sns.sqlite")
+	fake := &fakeSQS{
+		queues: map[string]sqsproto.QueueAttributes{
+			"arn:aws:sqs:us-east-1:123456789012:orders.fifo": {
+				ARN:    "arn:aws:sqs:us-east-1:123456789012:orders.fifo",
+				FIFO:   true,
+				Region: "us-east-1",
+			},
+		},
+		allowed: true,
+	}
+
+	store1, err := sqlitestore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("sqlitestore.Open() error = %v", err)
+	}
+	signer1, err := signing.NewProvider("/__sns/certs/current.pem")
+	if err != nil {
+		t.Fatalf("signing.NewProvider() error = %v", err)
+	}
+	material1, err := signer1.Material()
+	if err != nil {
+		t.Fatalf("signer.Material() error = %v", err)
+	}
+	if err := store1.SaveSigningMaterial(material1); err != nil {
+		t.Fatalf("store1.SaveSigningMaterial() error = %v", err)
+	}
+	svc1 := New(Config{Region: "us-east-1", AccountID: "123456789012", BaseURL: "http://localhost:4100"}, store1, util.RealClock{}, signer1, httpproto.NewAdapter(nil), fake)
+	topic, _, err := svc1.CreateTopic(context.Background(), testIdentity(), "orders.fifo", map[string]string{
+		"FifoTopic":                 "true",
+		"ContentBasedDeduplication": "false",
+	}, nil)
+	if err != nil {
+		t.Fatalf("CreateTopic() error = %v", err)
+	}
+	if _, err := svc1.Subscribe(context.Background(), testIdentity(), topic.ARN, "sqs", "arn:aws:sqs:us-east-1:123456789012:orders.fifo", map[string]string{
+		"RawMessageDelivery": "true",
+	}, true); err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+	if _, err := svc1.Publish(context.Background(), testIdentity(), testPublish(topic.ARN, "msg-1", "group-1", "dedup-1")); err != nil {
+		t.Fatalf("Publish(first) error = %v", err)
+	}
+	if err := svc1.Close(); err != nil {
+		t.Fatalf("svc1.Close() error = %v", err)
+	}
+
+	store2, err := sqlitestore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("sqlitestore.Open(reopen) error = %v", err)
+	}
+	material2, err := store2.LoadSigningMaterial()
+	if err != nil {
+		t.Fatalf("store2.LoadSigningMaterial() error = %v", err)
+	}
+	signer2, err := signing.NewProviderFromMaterial("/__sns/certs/current.pem", material2)
+	if err != nil {
+		t.Fatalf("signing.NewProviderFromMaterial() error = %v", err)
+	}
+	svc2 := New(Config{Region: "us-east-1", AccountID: "123456789012", BaseURL: "http://localhost:4100"}, store2, util.RealClock{}, signer2, httpproto.NewAdapter(nil), fake)
+	defer func() { _ = svc2.Close() }()
+	out, err := svc2.Publish(context.Background(), testIdentity(), testPublish(topic.ARN, "msg-1", "group-1", "dedup-1"))
+	if err != nil {
+		t.Fatalf("Publish(after restart) error = %v", err)
+	}
+	if !out.Deduplicated {
+		t.Fatalf("expected publish after restart to be deduplicated")
+	}
+	if len(fake.messages) != 1 {
+		t.Fatalf("expected only one SQS delivery across restart, got %d", len(fake.messages))
 	}
 }
 

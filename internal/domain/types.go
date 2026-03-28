@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"strings"
 	"time"
@@ -116,9 +117,7 @@ func (a TopicAttributes) AttributeMap() map[string]string {
 		"ContentBasedDeduplication": boolString(a.ContentBasedDeduplication),
 		"FifoThroughputScope":       a.FifoThroughputScope,
 	}
-	for k, v := range a.Unsupported {
-		attrs[k] = v
-	}
+	maps.Copy(attrs, a.Unsupported)
 	return attrs
 }
 
@@ -174,6 +173,12 @@ type ConfirmationToken struct {
 	AuthenticateOnUnsubscribe bool
 	Kind                      string
 	Restore                   *Subscription
+}
+
+type SigningMaterial struct {
+	PrivateKeyPEM []byte
+	CertPEM       []byte
+	CreatedAt     time.Time
 }
 
 type MessageAttributeValue struct {
@@ -256,6 +261,45 @@ type DeliveryAttempt struct {
 	Headers           map[string]string
 }
 
+type DeliveryJob struct {
+	ID                    string
+	Kind                  string
+	Payload               DeliveryJobPayload
+	EffectiveDeliveryJSON string
+	RawMessageDelivery    bool
+	RedrivePolicy         string
+	AttemptCount          int
+	NextAttemptAt         time.Time
+	LastError             string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+type DeliveryJobPayload struct {
+	Type              string
+	TopicARN          string
+	TopicOwner        string
+	SubscriptionARN   string
+	Protocol          string
+	Endpoint          string
+	MessageID         string
+	Subject           string
+	Message           string
+	ProtocolMessage   string
+	Timestamp         time.Time
+	Token             string
+	SubscribeURL      string
+	UnsubscribeURL    string
+	SignatureVersion  string
+	Signature         string
+	SigningCertURL    string
+	MessageAttributes map[string]MessageAttributeValue
+	GroupID           string
+	DeduplicationID   string
+	SequenceNumber    string
+	Headers           map[string]string
+}
+
 type DeliveryResult struct {
 	Success      bool
 	Retryable    bool
@@ -309,13 +353,9 @@ func CopyTopic(src *Topic) *Topic {
 		cp.Subscriptions[k] = struct{}{}
 	}
 	cp.GroupSequences = map[string]SequenceState{}
-	for k, v := range src.GroupSequences {
-		cp.GroupSequences[k] = v
-	}
+	maps.Copy(cp.GroupSequences, src.GroupSequences)
 	cp.DedupRecords = map[string]DedupRecord{}
-	for k, v := range src.DedupRecords {
-		cp.DedupRecords[k] = v
-	}
+	maps.Copy(cp.DedupRecords, src.DedupRecords)
 	cp.Attributes.Unsupported = cloneStringMap(src.Attributes.Unsupported)
 	return &cp
 }
@@ -328,13 +368,46 @@ func CopySubscription(src *Subscription) *Subscription {
 	return &cp
 }
 
+func CopyConfirmationToken(src ConfirmationToken) ConfirmationToken {
+	cp := src
+	if src.Restore != nil {
+		cp.Restore = CopySubscription(src.Restore)
+	}
+	return cp
+}
+
+func CopyDeliveryJob(src *DeliveryJob) *DeliveryJob {
+	if src == nil {
+		return nil
+	}
+	cp := *src
+	cp.Payload = CopyDeliveryJobPayload(src.Payload)
+	return &cp
+}
+
+func CopyDeliveryJobPayload(src DeliveryJobPayload) DeliveryJobPayload {
+	cp := src
+	cp.MessageAttributes = cloneMessageAttributes(src.MessageAttributes)
+	cp.Headers = cloneStringMap(src.Headers)
+	return cp
+}
+
 func cloneStringMap(src map[string]string) map[string]string {
 	if src == nil {
 		return map[string]string{}
 	}
 	dst := make(map[string]string, len(src))
+	maps.Copy(dst, src)
+	return dst
+}
+
+func cloneMessageAttributes(src map[string]MessageAttributeValue) map[string]MessageAttributeValue {
+	if src == nil {
+		return map[string]MessageAttributeValue{}
+	}
+	dst := make(map[string]MessageAttributeValue, len(src))
 	for k, v := range src {
-		dst[k] = v
+		dst[k] = v.DeepCopy()
 	}
 	return dst
 }

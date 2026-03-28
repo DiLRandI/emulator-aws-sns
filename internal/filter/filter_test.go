@@ -58,3 +58,23 @@ func TestMatchesBodyScopeRejectsInvalidJSON(t *testing.T) {
 		t.Fatalf("expected invalid JSON body to fail matching")
 	}
 }
+
+func TestMatchesAttributeScopeAdvancedOperators(t *testing.T) {
+	attrs := map[string]domain.MessageAttributeValue{
+		"env":      {DataType: "String", StringValue: "Prod"},
+		"host":     {DataType: "String", StringValue: "api.internal.example.com"},
+		"clientIp": {DataType: "String", StringValue: "10.2.3.4"},
+	}
+	policy := `{
+		"env": [{"equals-ignore-case": "prod"}],
+		"host": [{"wildcard": "*.example.com"}],
+		"clientIp": [{"cidr": "10.0.0.0/8"}]
+	}`
+	match, err := Matches(policy, domain.FilterScopeMessageAttributes, "", attrs)
+	if err != nil {
+		t.Fatalf("Matches() error = %v", err)
+	}
+	if !match {
+		t.Fatalf("expected advanced operators to match")
+	}
+}

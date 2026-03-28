@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/url"
 	"strings"
@@ -19,24 +20,49 @@ import (
 )
 
 type Provider struct {
-	key      *rsa.PrivateKey
-	certDER  []byte
-	certPEM  []byte
-	certPath string
+	key       *rsa.PrivateKey
+	certPEM   []byte
+	certPath  string
+	createdAt time.Time
 }
 
 func NewProvider(certPath string) (*Provider, error) {
+	return NewProviderFromMaterial(certPath, domain.SigningMaterial{})
+}
+
+func NewProviderFromMaterial(certPath string, material domain.SigningMaterial) (*Provider, error) {
+	if len(material.PrivateKeyPEM) == 0 || len(material.CertPEM) == 0 {
+		return generateProvider(certPath)
+	}
+	key, err := parsePrivateKey(material.PrivateKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+	createdAt := material.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	return &Provider{
+		key:       key,
+		certPEM:   append([]byte(nil), material.CertPEM...),
+		certPath:  certPath,
+		createdAt: createdAt,
+	}, nil
+}
+
+func generateProvider(certPath string) (*Provider, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now().UTC()
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		SerialNumber: big.NewInt(now.UnixNano()),
 		Subject: pkix.Name{
 			CommonName: "sns-emulator.local",
 		},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -46,7 +72,22 @@ func NewProvider(certPath string) (*Provider, error) {
 		return nil, err
 	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	return &Provider{key: key, certDER: certDER, certPEM: certPEM, certPath: certPath}, nil
+	return &Provider{
+		key:       key,
+		certPEM:   certPEM,
+		certPath:  certPath,
+		createdAt: now,
+	}, nil
+}
+
+func (p *Provider) Material() (domain.SigningMaterial, error) {
+	keyDER := x509.MarshalPKCS1PrivateKey(p.key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
+	return domain.SigningMaterial{
+		PrivateKeyPEM: keyPEM,
+		CertPEM:       p.CertPEM(),
+		CreatedAt:     p.createdAt,
+	}, nil
 }
 
 func (p *Provider) CertPEM() []byte {
@@ -103,4 +144,23 @@ func stringToSign(attempt *domain.DeliveryAttempt) string {
 		fields = append(fields, "Type", attempt.Type)
 	}
 	return strings.Join(fields, "\n")
+}
+
+func parsePrivateKey(keyPEM []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, errors.New("invalid private key pem")
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	keyAny, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := keyAny.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("private key is not RSA")
+	}
+	return key, nil
 }

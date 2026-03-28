@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"emulator-aws-sns/internal/domain"
 )
 
-func Matches(policyJSON string, scope string, message string, attrs map[string]domain.MessageAttributeValue) (bool, error) {
+func Matches(policyJSON, scope, message string, attrs map[string]domain.MessageAttributeValue) (bool, error) {
 	if strings.TrimSpace(policyJSON) == "" {
 		return true, nil
 	}
@@ -75,7 +77,7 @@ func attributeRoot(attrs map[string]domain.MessageAttributeValue) map[string]any
 	return out
 }
 
-func evalObject(policy map[string]any, candidate map[string]any, nested bool) (bool, error) {
+func evalObject(policy, candidate map[string]any, nested bool) (bool, error) {
 	orMatched := true
 	for key, value := range policy {
 		if key == "$or" {
@@ -178,17 +180,16 @@ func validateOperator(operator map[string]any) error {
 				if len(typed) != 1 {
 					return fmt.Errorf("anything-but supports one nested operator")
 				}
-				if _, ok := typed["prefix"]; ok {
-					return nil
-				}
-				if _, ok := typed["suffix"]; ok {
-					return nil
+				for _, key := range []string{"prefix", "suffix", "equals-ignore-case", "wildcard", "cidr"} {
+					if _, ok := typed[key]; ok {
+						return validateOperator(typed)
+					}
 				}
 				return fmt.Errorf("unsupported anything-but nested operator")
 			default:
 				return fmt.Errorf("unsupported anything-but value")
 			}
-		case "prefix", "suffix":
+		case "prefix", "suffix", "equals-ignore-case", "wildcard", "cidr":
 			if _, ok := value.(string); !ok {
 				return fmt.Errorf("%s must be a string", key)
 			}
@@ -242,7 +243,7 @@ func evalConditions(conditions []any, candidate any, exists bool) (bool, error) 
 	return false, nil
 }
 
-func evalCondition(condition any, candidate any, exists bool) (bool, error) {
+func evalCondition(condition, candidate any, exists bool) (bool, error) {
 	switch typed := condition.(type) {
 	case string, float64, bool, nil:
 		return scalarOrArrayContains(candidate, typed), nil
@@ -260,6 +261,15 @@ func evalCondition(condition any, candidate any, exists bool) (bool, error) {
 		if suffix, ok := typed["suffix"]; ok {
 			return evalSuffix(suffix, candidate), nil
 		}
+		if equalsIgnoreCase, ok := typed["equals-ignore-case"]; ok {
+			return evalEqualsIgnoreCase(equalsIgnoreCase, candidate), nil
+		}
+		if wildcard, ok := typed["wildcard"]; ok {
+			return evalWildcard(wildcard, candidate)
+		}
+		if cidr, ok := typed["cidr"]; ok {
+			return evalCIDR(cidr, candidate)
+		}
 		if numeric, ok := typed["numeric"]; ok {
 			return evalNumeric(numeric, candidate)
 		}
@@ -269,7 +279,7 @@ func evalCondition(condition any, candidate any, exists bool) (bool, error) {
 	}
 }
 
-func evalAnythingBut(rule any, candidate any) bool {
+func evalAnythingBut(rule, candidate any) bool {
 	switch typed := rule.(type) {
 	case string, float64, bool, nil:
 		return !scalarOrArrayContains(candidate, typed)
@@ -287,11 +297,22 @@ func evalAnythingBut(rule any, candidate any) bool {
 		if suffix, ok := typed["suffix"]; ok {
 			return !evalSuffix(suffix, candidate)
 		}
+		if equalsIgnoreCase, ok := typed["equals-ignore-case"]; ok {
+			return !evalEqualsIgnoreCase(equalsIgnoreCase, candidate)
+		}
+		if wildcard, ok := typed["wildcard"]; ok {
+			match, _ := evalWildcard(wildcard, candidate)
+			return !match
+		}
+		if cidr, ok := typed["cidr"]; ok {
+			match, _ := evalCIDR(cidr, candidate)
+			return !match
+		}
 	}
 	return false
 }
 
-func evalPrefix(rule any, candidate any) bool {
+func evalPrefix(rule, candidate any) bool {
 	want, ok := rule.(string)
 	if !ok {
 		return false
@@ -305,7 +326,7 @@ func evalPrefix(rule any, candidate any) bool {
 	return false
 }
 
-func evalSuffix(rule any, candidate any) bool {
+func evalSuffix(rule, candidate any) bool {
 	want, ok := rule.(string)
 	if !ok {
 		return false
@@ -319,7 +340,61 @@ func evalSuffix(rule any, candidate any) bool {
 	return false
 }
 
-func evalNumeric(rule any, candidate any) (bool, error) {
+func evalEqualsIgnoreCase(rule, candidate any) bool {
+	want, ok := rule.(string)
+	if !ok {
+		return false
+	}
+	for _, value := range flatten(candidate) {
+		s, ok := value.(string)
+		if ok && strings.EqualFold(s, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func evalWildcard(rule, candidate any) (bool, error) {
+	pattern, ok := rule.(string)
+	if !ok {
+		return false, fmt.Errorf("wildcard must be a string")
+	}
+	re, err := wildcardRegexp(pattern)
+	if err != nil {
+		return false, err
+	}
+	for _, value := range flatten(candidate) {
+		s, ok := value.(string)
+		if ok && re.MatchString(s) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func evalCIDR(rule, candidate any) (bool, error) {
+	raw, ok := rule.(string)
+	if !ok {
+		return false, fmt.Errorf("cidr must be a string")
+	}
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		return false, err
+	}
+	for _, value := range flatten(candidate) {
+		s, ok := value.(string)
+		if !ok {
+			continue
+		}
+		addr, err := netip.ParseAddr(s)
+		if err == nil && prefix.Contains(addr) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func evalNumeric(rule, candidate any) (bool, error) {
 	clauses, ok := rule.([]any)
 	if !ok || len(clauses)%2 != 0 {
 		return false, fmt.Errorf("invalid numeric clause")
@@ -366,7 +441,7 @@ func compareNumeric(value float64, op string, compare float64) bool {
 	}
 }
 
-func scalarOrArrayContains(candidate any, expected any) bool {
+func scalarOrArrayContains(candidate, expected any) bool {
 	for _, item := range flatten(candidate) {
 		if equal(item, expected) {
 			return true
@@ -411,4 +486,21 @@ func toFloat(v any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func wildcardRegexp(pattern string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	for _, r := range pattern {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
 }

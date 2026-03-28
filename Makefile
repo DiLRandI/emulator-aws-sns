@@ -3,6 +3,7 @@ SHELL := /bin/sh
 BINARY := bin/snsd
 IMAGE ?= emulator-aws-sns:latest
 PORT ?= 4100
+DATA_DIR ?= $(CURDIR)/.data
 AWS_REGION ?= us-east-1
 AWS_ACCOUNT_ID ?= 123456789012
 
@@ -50,7 +51,9 @@ docker-build:
 	docker build -t $(IMAGE) .
 
 docker-run:
+	mkdir -p $(DATA_DIR)
 	docker run --rm -p $(PORT):4100 \
+		-v $(DATA_DIR):/data \
 		-e SNS_ADDR=:4100 \
 		-e AWS_REGION=$(AWS_REGION) \
 		-e AWS_ACCOUNT_ID=$(AWS_ACCOUNT_ID) \

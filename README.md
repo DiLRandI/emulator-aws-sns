@@ -33,20 +33,24 @@ AWS-compatible Amazon SNS emulator in Go, focused on application-to-application 
 - Raw message delivery for SQS and HTTP/HTTPS
 - HTTP/HTTPS confirmation and unsubscribe confirmation flows
 - Local signing certificate route for SNS-style webhook signatures
-- In-memory storage behind service/store abstractions
+- Strict SigV4 verification with configurable bypass mode
+- In-memory and SQLite-backed storage behind service/store abstractions
 
 ## Intentionally deferred
 
 - SMS, email, mobile push, and platform application endpoint families
 - Archive replay behavior
 - X-Ray side effects for `TracingConfig`
-- Additional filter operators such as `wildcard`, `equals-ignore-case`, and `cidr`
-- Strict SigV4 request validation
-- Durable persistence
+- Full KMS/data-protection semantics beyond attribute round-tripping
 
-## Why storage is still in-memory
+## Storage modes
 
-SQLite was intentionally deferred for this stage. The emulator already has clean boundaries between API handling, services, policy/filter logic, and the storage layer in `internal/store/memory`, so SNS correctness and integration-test usability do not require durable persistence yet. A future SQLite backend can replace the current store implementation without changing the public HTTP behavior.
+The emulator now supports:
+
+- `SNS_STORE=memory` for fast ephemeral tests
+- `SNS_STORE=sqlite` with `SNS_SQLITE_PATH=/path/to/sns.sqlite` for durable local runs
+
+SQLite preserves topics, subscriptions, confirmation tokens, FIFO counters, deduplication windows, delivery jobs, and signing material across process restarts.
 
 ## Build and run
 
@@ -65,12 +69,28 @@ Environment variables:
 
 - `SNS_ADDR`
 - `SNS_BASE_URL`
+- `SNS_STORE`
+- `SNS_SQLITE_PATH`
+- `SNS_AUTH_MODE`
+- `SNS_CREDENTIALS`
 - `AWS_REGION`
 - `AWS_ACCOUNT_ID`
 - `SQS_ENDPOINT`
 - `SNS_PAGE_SIZE`
 
 `SNS_BASE_URL` is useful when confirmation and unsubscribe URLs must be reachable from outside the process host.
+
+Auth defaults to strict SigV4 verification. To allow unsigned local requests, set:
+
+```bash
+SNS_AUTH_MODE=bypass
+```
+
+Static credentials are configured with:
+
+```bash
+SNS_CREDENTIALS=test:test:test
+```
 
 ## AWS CLI usage
 
@@ -189,7 +209,10 @@ Equivalent manual command:
 
 ```bash
 docker run --rm -p 4100:4100 \
+  -v $(pwd)/data:/data \
   -e SNS_ADDR=:4100 \
+  -e SNS_STORE=sqlite \
+  -e SNS_SQLITE_PATH=/data/sns.sqlite \
   -e AWS_REGION=us-east-1 \
   -e AWS_ACCOUNT_ID=123456789012 \
   emulator-aws-sns:latest
@@ -199,4 +222,11 @@ Then point AWS CLI at:
 
 ```bash
 aws --endpoint-url http://127.0.0.1:4100 sns list-topics
+```
+
+Health and readiness endpoints:
+
+```bash
+curl http://127.0.0.1:4100/__health
+curl http://127.0.0.1:4100/__ready
 ```

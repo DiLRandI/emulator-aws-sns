@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"emulator-aws-sns/internal/api"
+	"emulator-aws-sns/internal/auth"
 	httpproto "emulator-aws-sns/internal/protocol/http"
 	"emulator-aws-sns/internal/service"
 	"emulator-aws-sns/internal/signing"
@@ -92,7 +93,9 @@ func startSNSServer(t *testing.T) string {
 		BaseURL:   "http://127.0.0.1:0",
 		PageSize:  100,
 	}, memory.NewStore(), util.RealClock{}, signer, httpproto.NewAdapter(nil), nil)
-	handler := api.New(svc, signer, "123456789012").Routes()
+	t.Cleanup(func() { _ = svc.Close() })
+	verifier := auth.NewVerifier("123456789012", "us-east-1", auth.ModeBypass, []auth.Credential{{AccessKeyID: "test", SecretAccessKey: "test", SessionToken: "test"}})
+	handler := api.New(svc, signer, verifier).Routes()
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
 	svc.SetBaseURL(ts.URL)
