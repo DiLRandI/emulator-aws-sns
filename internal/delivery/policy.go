@@ -180,7 +180,7 @@ func RetryDelays(policy SubscriptionPolicy) ([]time.Duration, error) {
 	for i := 0; i < rp.NumMinDelayRetries; i++ {
 		out = append(out, time.Duration(rp.MinDelayTarget)*time.Second)
 	}
-	for i := 0; i < backoffRetries; i++ {
+	for i := range backoffRetries {
 		out = append(out, time.Duration(backoffDelay(rp, i, backoffRetries))*time.Second)
 	}
 	for i := 0; i < rp.NumMaxDelayRetries; i++ {
